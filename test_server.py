@@ -60,7 +60,7 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(status,201)
         item=json.loads(body)
         self.assertTrue(item['hasImage'])
-        self.assertEqual(item['imageUrl'],f"/api/transactions/{item['id']}/image")
+        self.assertEqual(item['imageUrl'],f"/api/transactions/{item['id']}/image?userId=1")
         status,body,headers=self.request(item['imageUrl'])
         self.assertEqual(status,200)
         self.assertEqual(headers.get_content_type(),'image/png')
@@ -81,6 +81,27 @@ class LedgerTests(unittest.TestCase):
             with self.subTest(image=image[:30]):
                 self.assertEqual(self.request(method='POST',data={**self.entry,'image':image})[0],400)
         self.assertEqual(json.loads(self.request()[1]),[])
+    def test_users_and_transaction_isolation(self):
+        users=json.loads(self.request('/api/users')[1])
+        self.assertEqual([user['name'] for user in users],['私'])
+        status,body,_=self.request('/api/users','POST',{'name':' 家族 '})
+        self.assertEqual(status,201)
+        family=json.loads(body)
+        self.assertEqual(family['name'],'家族')
+        self.assertEqual(self.request('/api/users','POST',{'name':'家族'})[0],409)
+        self.assertEqual(self.request('/api/users','POST',{'name':' '})[0],400)
+        status,body,_=self.request(method='POST',data={**self.entry,'userId':family['id']})
+        self.assertEqual(status,201)
+        item=json.loads(body)
+        self.assertEqual(item['userId'],family['id'])
+        self.assertEqual(json.loads(self.request('/api/transactions?userId=1')[1]),[])
+        family_rows=json.loads(self.request(f"/api/transactions?userId={family['id']}")[1])
+        self.assertEqual([row['title'] for row in family_rows],['テストの食費'])
+        path=f"/api/transactions/{item['id']}"
+        self.assertEqual(self.request(path,'PUT',{**self.entry,'userId':1})[0],404)
+        self.assertEqual(self.request(path+'?userId=1','DELETE')[0],404)
+        self.assertEqual(self.request(path+f"?userId={family['id']}",'DELETE')[0],204)
+        self.assertEqual(self.request('/api/transactions?userId=999')[0],400)
     def test_missing_record(self):
         self.assertEqual(self.request('/api/transactions/999','PUT',self.entry)[0],404)
         self.assertEqual(self.request('/api/transactions/999','DELETE')[0],404)
@@ -98,6 +119,7 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(row[0],'メモ')
             self.assertEqual(row[1],self.PNG)
             self.assertEqual(row[2],'image/png')
+            self.assertEqual(db.execute('SELECT name FROM users').fetchone()[0],'私')
     def test_private_files_not_served(self):
         for path in ['/kakeibo.sqlite3','/server.py','/.backup/index.html','/../server.py','/unknown']:
             self.assertEqual(self.request(path)[0],404)
@@ -123,6 +145,9 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(row['note'],'')
         self.assertIsNone(row['image'])
         self.assertIsNone(row['image_mime'])
+        self.assertIsInstance(row['user_id'],int)
+        with server.connection() as db:
+            self.assertEqual(db.execute('SELECT name FROM users WHERE id=?',(row['user_id'],)).fetchone()[0],'私')
         self.assertEqual(len(list(Path(self.temp.name).glob('old.before-migration-*.sqlite3'))),1)
 
 if __name__=='__main__': unittest.main(verbosity=2)

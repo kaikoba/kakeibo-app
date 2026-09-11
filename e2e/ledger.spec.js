@@ -100,6 +100,7 @@ test('モバイル幅でも主要操作が表示され、ページ全体が横�
   await expect(page.locator('#pageTitle')).toHaveText('収支台帳');
   await expect(page.locator('#openEntry')).toBeVisible();
   await expect(page.locator('#searchInput')).toBeVisible();
+  await expect(page.locator('#userSwitcher')).toBeVisible();
 
   const dimensions = await page.evaluate(() => ({
     viewport: document.documentElement.clientWidth,
@@ -111,4 +112,37 @@ test('モバイル幅でも主要操作が表示され、ページ全体が横�
   await expect(page.locator('#pageTitle')).toHaveText('月次レポート');
   await page.getByRole('link', { name: '設定・データ管理' }).click();
   await expect(page.locator('#pageTitle')).toHaveText('設定・データ管理');
+});
+
+test('利用者を追加して収支を利用者ごとに分けられる', async ({ page }) => {
+  await page.goto('/#settings');
+  const switcher = page.locator('#userSwitcher');
+  await expect(switcher).toHaveValue('1');
+  await expect(switcher.locator('option')).toHaveText(['私']);
+
+  await page.locator('input[name="userName"]').fill('家族');
+  await page.getByRole('button', { name: '利用者を追加' }).click();
+  await expect(page.locator('#toast')).toHaveText('家族を追加しました');
+  await expect(switcher.locator('option')).toHaveText(['私', '家族']);
+  await expect(switcher).toHaveValue('2');
+
+  await page.getByRole('link', { name: '収支台帳' }).click();
+  await expect(page.locator('#ledgerTable')).toContainText('この月の記録はまだありません');
+  await page.locator('#openEntry').click();
+  const dialog = page.locator('#entryDialog');
+  await dialog.locator('input[name="title"]').fill('家族の買い物');
+  await dialog.locator('input[name="amount"]').fill('980');
+  await dialog.locator('input[name="date"]').fill('2026-09-08');
+  await dialog.locator('#saveEntry').click();
+  const familyRow = page.getByRole('row').filter({ hasText: '家族の買い物' });
+  await expect(familyRow).toBeVisible();
+
+  await switcher.selectOption({ label: '私' });
+  await expect(page.locator('#ledgerTable')).toContainText('この月の記録はまだありません');
+  await switcher.selectOption({ label: '家族' });
+  await expect(familyRow).toContainText('−¥980');
+
+  await familyRow.getByRole('button', { name: '家族の買い物を削除' }).click();
+  await page.locator('#deleteDialog').getByRole('button', { name: '削除する' }).click();
+  await expect(page.locator('#ledgerTable')).toContainText('この月の記録はまだありません');
 });
