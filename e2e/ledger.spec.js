@@ -1,5 +1,6 @@
 const { test, expect } = require('@playwright/test');
 const fs = require('node:fs/promises');
+const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
 
 test('収支の登録から集計、編集、検索、CSV出力、削除まで動作する', async ({ page }) => {
   const browserErrors = [];
@@ -27,6 +28,8 @@ test('収支の登録から集計、編集、検索、CSV出力、削除まで�
   await dialog.locator('input[name="amount"]').fill('1234');
   await dialog.locator('input[name="date"]').fill('2026-09-08');
   await dialog.locator('textarea[name="note"]').fill('Playwrightで登録');
+  await dialog.locator('#imageInput').setInputFiles({ name: 'receipt.png', mimeType: 'image/png', buffer: png });
+  await expect(dialog.locator('#imagePreview')).toBeVisible();
   await dialog.locator('#saveEntry').click();
 
   await expect(dialog).toBeHidden();
@@ -34,6 +37,13 @@ test('収支の登録から集計、編集、検索、CSV出力、削除まで�
   const row = page.getByRole('row').filter({ hasText: 'E2E 食費テスト' });
   await expect(row).toContainText('−¥1,234');
   await expect(row).toContainText('Playwrightで登録');
+  const photoButton = row.getByRole('button', { name: 'E2E 食費テストの画像を表示' });
+  await expect(photoButton).toBeVisible();
+  await photoButton.click();
+  const imageDialog = page.locator('#imageDialog');
+  await expect(imageDialog).toBeVisible();
+  await expect(imageDialog.locator('#fullImage')).toHaveAttribute('src', /\/api\/transactions\/\d+\/image/);
+  await imageDialog.getByRole('button', { name: '閉じる' }).click();
 
   const downloadPromise = page.waitForEvent('download');
   await page.locator('#exportFiltered').click();
@@ -44,10 +54,13 @@ test('収支の登録から集計、編集、検索、CSV出力、削除まで�
   expect(csv.toString('utf8')).toContain('E2E 食費テスト');
 
   await row.getByRole('button', { name: 'E2E 食費テストを編集' }).click();
+  await expect(dialog.locator('#imagePreview')).toBeVisible();
   await dialog.locator('input[name="amount"]').fill('2345');
+  await dialog.locator('#removeImage').click();
   await dialog.locator('#saveEntry').click();
   await expect(dialog).toBeHidden();
   await expect(row).toContainText('−¥2,345');
+  await expect(photoButton).toHaveCount(0);
 
   await page.locator('#searchInput').fill('存在しない記録');
   await expect(page.locator('#ledgerTable')).toContainText('条件に合う記録がありません');
