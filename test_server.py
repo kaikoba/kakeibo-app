@@ -1,5 +1,6 @@
 """Integration checks use a temporary database; personal records are never touched."""
 import json
+import base64
 import sqlite3
 import tempfile
 import threading
@@ -11,6 +12,7 @@ from urllib.error import HTTPError
 import server
 
 class LedgerTests(unittest.TestCase):
+    PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=')
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.previous = server.DB_PATH
@@ -52,11 +54,39 @@ class LedgerTests(unittest.TestCase):
             with self.subTest(patch=patch):
                 self.assertEqual(self.request(method='POST',data={**self.entry,**patch})[0],400)
         self.assertEqual(json.loads(self.request()[1]),[])
+    def test_image_upload_serve_preserve_and_remove(self):
+        data_url='data:image/png;base64,'+base64.b64encode(self.PNG).decode()
+        status,body,_=self.request(method='POST',data={**self.entry,'image':data_url})
+        self.assertEqual(status,201)
+        item=json.loads(body)
+        self.assertTrue(item['hasImage'])
+        self.assertEqual(item['imageUrl'],f"/api/transactions/{item['id']}/image")
+        status,body,headers=self.request(item['imageUrl'])
+        self.assertEqual(status,200)
+        self.assertEqual(headers.get_content_type(),'image/png')
+        self.assertEqual(body,self.PNG)
+        path=f"/api/transactions/{item['id']}"
+        updated=json.loads(self.request(path,'PUT',{**self.entry,'amount':2400})[1])
+        self.assertTrue(updated['hasImage'])
+        removed=json.loads(self.request(path,'PUT',{**self.entry,'image':None})[1])
+        self.assertFalse(removed['hasImage'])
+        self.assertEqual(self.request(item['imageUrl'])[0],404)
+    def test_invalid_images(self):
+        invalid=[
+            'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yw=',
+            'data:image/png;base64,'+base64.b64encode(b'not a png').decode(),
+            'data:image/png;base64,***',
+        ]
+        for image in invalid:
+            with self.subTest(image=image[:30]):
+                self.assertEqual(self.request(method='POST',data={**self.entry,'image':image})[0],400)
+        self.assertEqual(json.loads(self.request()[1]),[])
     def test_missing_record(self):
         self.assertEqual(self.request('/api/transactions/999','PUT',self.entry)[0],404)
         self.assertEqual(self.request('/api/transactions/999','DELETE')[0],404)
     def test_backup_snapshot(self):
-        self.request(method='POST',data=self.entry)
+        data_url='data:image/png;base64,'+base64.b64encode(self.PNG).decode()
+        self.request(method='POST',data={**self.entry,'image':data_url})
         status,body,headers=self.request('/api/backup')
         self.assertEqual(status,200)
         self.assertIn('attachment',headers['Content-Disposition'])
@@ -64,7 +94,10 @@ class LedgerTests(unittest.TestCase):
         path.write_bytes(body)
         with closing(sqlite3.connect(path)) as db:
             self.assertEqual(db.execute('PRAGMA integrity_check').fetchone()[0],'ok')
-            self.assertEqual(db.execute('SELECT note FROM transactions').fetchone()[0],'メモ')
+            row=db.execute('SELECT note,image,image_mime FROM transactions').fetchone()
+            self.assertEqual(row[0],'メモ')
+            self.assertEqual(row[1],self.PNG)
+            self.assertEqual(row[2],'image/png')
     def test_private_files_not_served(self):
         for path in ['/kakeibo.sqlite3','/server.py','/.backup/index.html','/../server.py','/unknown']:
             self.assertEqual(self.request(path)[0],404)
@@ -88,6 +121,8 @@ class LedgerTests(unittest.TestCase):
             row=dict(db.execute('SELECT * FROM transactions').fetchone())
         self.assertEqual(row['title'],'既存')
         self.assertEqual(row['note'],'')
+        self.assertIsNone(row['image'])
+        self.assertIsNone(row['image_mime'])
         self.assertEqual(len(list(Path(self.temp.name).glob('old.before-migration-*.sqlite3'))),1)
 
 if __name__=='__main__': unittest.main(verbosity=2)
