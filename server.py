@@ -10,7 +10,7 @@ from contextlib import closing, contextmanager
 from datetime import date, datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / 'kakeibo.sqlite3'
@@ -27,6 +27,7 @@ IMAGE_TYPES = {
 def connection():
     db = sqlite3.connect(DB_PATH, timeout=10)
     db.row_factory = sqlite3.Row
+    db.execute('PRAGMA foreign_keys = ON')
     try:
         with db:
             yield db
@@ -38,13 +39,22 @@ def initialize_database():
     if DB_PATH.exists():
         with connection() as db:
             columns = [row[1] for row in db.execute('PRAGMA table_info(transactions)')]
-            if columns and any(name not in columns for name in ('note', 'image', 'image_mime')):
+            if columns and any(name not in columns for name in ('note', 'image', 'image_mime', 'user_id')):
                 backup = DB_PATH.with_name(f'{DB_PATH.stem}.before-migration-{datetime.now():%Y%m%d-%H%M%S-%f}.sqlite3')
                 with closing(sqlite3.connect(backup)) as target:
                     db.backup(target)
     with connection() as db:
+        db.execute('''CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )''')
+        if not db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
+            db.execute("INSERT INTO users(name) VALUES('私')")
+        default_user_id = db.execute('SELECT id FROM users ORDER BY id LIMIT 1').fetchone()[0]
         db.execute('''CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id),
             title TEXT NOT NULL,
             amount INTEGER NOT NULL CHECK(amount > 0),
             type TEXT NOT NULL CHECK(type IN ('income','expense')),
@@ -61,12 +71,17 @@ def initialize_database():
             db.execute('ALTER TABLE transactions ADD COLUMN image BLOB')
         if 'image_mime' not in columns:
             db.execute('ALTER TABLE transactions ADD COLUMN image_mime TEXT')
+        if 'user_id' not in columns:
+            db.execute('ALTER TABLE transactions ADD COLUMN user_id INTEGER REFERENCES users(id)')
+            db.execute('UPDATE transactions SET user_id=? WHERE user_id IS NULL',(default_user_id,))
         db.execute('CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date)')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_transactions_user_date ON transactions(user_id,date)')
 
 def serialize_transaction(row):
     result = {key: row[key] for key in ('id', 'title', 'amount', 'type', 'category', 'date', 'note')}
+    result['userId'] = row['user_id']
     result['hasImage'] = row['image'] is not None
-    result['imageUrl'] = f"/api/transactions/{row['id']}/image" if result['hasImage'] else None
+    result['imageUrl'] = f"/api/transactions/{row['id']}/image?userId={row['user_id']}" if result['hasImage'] else None
     return result
 
 def validate_image(value):
@@ -87,6 +102,24 @@ def validate_image(value):
     if not IMAGE_TYPES[mime](body):
         raise ValueError('画像の内容とファイル形式が一致しません。')
     return body, mime
+
+def validate_user_name(data):
+    if not isinstance(data, dict) or not isinstance(data.get('name'), str):
+        raise ValueError('利用者名を入力してください。')
+    name = data['name'].strip()
+    if not name or len(name) > 40:
+        raise ValueError('利用者名は40文字以内で入力してください。')
+    return name
+
+def resolve_user_id(db, value=None):
+    if value is None:
+        row = db.execute('SELECT id FROM users ORDER BY id LIMIT 1').fetchone()
+        return row[0]
+    if type(value) is not int or value < 1:
+        raise ValueError('利用者を正しく選択してください。')
+    if not db.execute('SELECT 1 FROM users WHERE id=?',(value,)).fetchone():
+        raise ValueError('選択した利用者が見つかりません。')
+    return value
 
 def validate(data):
     if not isinstance(data, dict):
@@ -159,15 +192,24 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         if not self.allowed(): return
-        path = urlparse(self.path).path
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
         try:
             if path == '/api/transactions':
                 with connection() as db:
-                    rows = db.execute('SELECT * FROM transactions ORDER BY date DESC,id DESC').fetchall()
+                    requested = parse_qs(parsed_url.query).get('userId',[None])[0]
+                    user_id = resolve_user_id(db, int(requested) if requested and requested.isdecimal() else requested)
+                    rows = db.execute('SELECT * FROM transactions WHERE user_id=? ORDER BY date DESC,id DESC',(user_id,)).fetchall()
                 self.send_json(200,[serialize_transaction(row) for row in rows])
+            elif path == '/api/users':
+                with connection() as db:
+                    rows = db.execute('SELECT id,name,created_at FROM users ORDER BY id').fetchall()
+                self.send_json(200,[dict(row) for row in rows])
             elif match := re.fullmatch(r'/api/transactions/([1-9]\d{0,17})/image', path):
                 with connection() as db:
-                    row = db.execute('SELECT image,image_mime FROM transactions WHERE id=?',(int(match[1]),)).fetchone()
+                    requested = parse_qs(parsed_url.query).get('userId',[None])[0]
+                    user_id = resolve_user_id(db, int(requested) if requested and requested.isdecimal() else requested)
+                    row = db.execute('SELECT image,image_mime FROM transactions WHERE id=? AND user_id=?',(int(match[1]),user_id)).fetchone()
                 if not row or row['image'] is None:
                     self.send_json(404,{'error':'画像が見つかりません。'})
                     return
@@ -195,6 +237,8 @@ class Handler(SimpleHTTPRequestHandler):
                 super().do_GET()
             else:
                 self.send_json(404,{'error':'ページが見つかりません。'})
+        except ValueError as error:
+            self.send_json(400,{'error':str(error)})
         except sqlite3.Error:
             self.send_json(503,{'error':'データベースに接続できません。しばらくしてから再試行してください。'})
 
@@ -209,7 +253,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     def mutation(self,method):
         if not self.allowed(mutation=True): return
-        path = urlparse(self.path).path
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
         match = re.fullmatch(r'/api/transactions/([1-9]\d{0,17})',path)
         if (method == 'POST' and path != '/api/transactions') or (method != 'POST' and not match):
             self.send_json(404,{'error':'記録が見つかりません。'})
@@ -220,19 +265,24 @@ class Handler(SimpleHTTPRequestHandler):
             data = validate(payload) if method != 'DELETE' else None
             image_update = validate_image(payload['image']) if method != 'DELETE' and 'image' in payload else None
             with connection() as db:
-                if item_id is not None and not db.execute('SELECT id FROM transactions WHERE id=?',(item_id,)).fetchone():
+                if method == 'DELETE':
+                    requested = parse_qs(parsed_url.query).get('userId',[None])[0]
+                    user_id = resolve_user_id(db, int(requested) if requested and requested.isdecimal() else requested)
+                else:
+                    user_id = resolve_user_id(db, payload.get('userId'))
+                if item_id is not None and not db.execute('SELECT id FROM transactions WHERE id=? AND user_id=?',(item_id,user_id)).fetchone():
                     self.send_json(404,{'error':'この記録はすでに削除されています。再読み込みしてください。'})
                     return
                 if method == 'DELETE':
-                    db.execute('DELETE FROM transactions WHERE id=?',(item_id,))
+                    db.execute('DELETE FROM transactions WHERE id=? AND user_id=?',(item_id,user_id))
                     result = None
                 else:
                     values = tuple(data[key] for key in ('title','amount','type','category','date','note'))
                     if method == 'POST':
                         image, image_mime = image_update or (None, None)
-                        item_id = db.execute('INSERT INTO transactions(title,amount,type,category,date,note,image,image_mime) VALUES(?,?,?,?,?,?,?,?)',values+(image,image_mime)).lastrowid
+                        item_id = db.execute('INSERT INTO transactions(user_id,title,amount,type,category,date,note,image,image_mime) VALUES(?,?,?,?,?,?,?,?,?)',(user_id,)+values+(image,image_mime)).lastrowid
                     else:
-                        db.execute('UPDATE transactions SET title=?,amount=?,type=?,category=?,date=?,note=? WHERE id=?',values+(item_id,))
+                        db.execute('UPDATE transactions SET user_id=?,title=?,amount=?,type=?,category=?,date=?,note=? WHERE id=?',(user_id,)+values+(item_id,))
                         if image_update is not None:
                             db.execute('UPDATE transactions SET image=?,image_mime=? WHERE id=?',image_update+(item_id,))
                     result = serialize_transaction(db.execute('SELECT * FROM transactions WHERE id=?',(item_id,)).fetchone())
@@ -242,7 +292,24 @@ class Handler(SimpleHTTPRequestHandler):
         except sqlite3.Error:
             self.send_json(503,{'error':'保存できませんでした。しばらくしてから再試行してください。'})
 
-    def do_POST(self): self.mutation('POST')
+    def create_user(self):
+        if not self.allowed(mutation=True): return
+        try:
+            name = validate_user_name(self.read_json())
+            with connection() as db:
+                item_id = db.execute('INSERT INTO users(name) VALUES(?)',(name,)).lastrowid
+                result = dict(db.execute('SELECT id,name,created_at FROM users WHERE id=?',(item_id,)).fetchone())
+            self.send_json(201,result)
+        except ValueError as error:
+            self.send_json(400,{'error':str(error)})
+        except sqlite3.IntegrityError:
+            self.send_json(409,{'error':'同じ名前の利用者がすでにいます。'})
+        except sqlite3.Error:
+            self.send_json(503,{'error':'利用者を追加できませんでした。しばらくしてから再試行してください。'})
+
+    def do_POST(self):
+        if urlparse(self.path).path == '/api/users': self.create_user()
+        else: self.mutation('POST')
     def do_PUT(self): self.mutation('PUT')
     def do_DELETE(self): self.mutation('DELETE')
 
